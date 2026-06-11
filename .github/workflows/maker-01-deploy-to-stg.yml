@@ -33,7 +33,7 @@ on:
 
 permissions:
   actions: write         # deploy-to-stg.yml を即時 dispatch (即時 merge 経路) するため
-  contents: read         # release PR の base/head を読むため
+  contents: write        # gh pr merge / auto-merge enable に必要 (read だと GraphQL "Resource not accessible by integration")
   pull-requests: write   # release PR の起票 + auto-merge
 
 jobs:
