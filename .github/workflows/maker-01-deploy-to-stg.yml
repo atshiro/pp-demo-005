@@ -1,0 +1,128 @@
+# Maker - STG 環境へデプロイ (再 export なし版)
+#
+# CICD コンパニオン App が未配備の案件で、Maker が GitHub Actions UI から STG デプロイを依頼するラッパー。
+#
+# 【動作】 develop → main の release PR を起票 → auto-merge → deploy-to-stg.yml が連鎖実行。
+# 再 export (DEV → develop) は行わない。ADR-015 で「STG デプロイは maker-00 (DEV から保存)
+# 前段必須」と定めたため、develop には常に最新 Solution と bump 済 Version が積まれている前提。
+# よって maker-01 は「現在の develop を main に流す」だけで足りる。
+#
+# 操作: Actions タブ → "Maker - STG 環境へデプロイ" → "Run workflow" → Solution 名 / 変更概要 → "Run"
+#
+# 前提:
+#   - 事前に maker-00 (DEV から保存) を実行済み (= 最新 Solution が develop に commit 済)
+#   - 初回 or Connection 再作成時は maker-03 / 04 で settings に値を埋め済 (未入力だと deploy-to-stg の preflight でブロック)
+
+name: Maker - STG 環境へデプロイ
+
+run-name: "STG デプロイ: ${{ inputs.solution_name }} (by @${{ github.actor }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      solution_name:
+        description: "デプロイする Solution の Unique Name (DEV で開発中のもの)"
+        required: true
+        type: string
+        default: "SampleSolution"
+      reason:
+        description: "変更概要 (PR 本文に転記、CoE レビュー用) - 200 字程度"
+        required: true
+        type: string
+        default: "営業ダッシュボードに新規ビューを追加"
+
+permissions:
+  actions: write         # deploy-to-stg.yml を即時 dispatch (即時 merge 経路) するため
+  contents: read         # release PR の base/head を読むため
+  pull-requests: write   # release PR の起票 + auto-merge
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open release PR (develop -> main)
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOLUTION_NAME: ${{ inputs.solution_name }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          AHEAD=$(gh api "/repos/${{ github.repository }}/compare/main...develop" --jq '.ahead_by')
+          if [ "$AHEAD" = "0" ]; then
+            echo "::error::develop と main は同じ commit です。release する内容がありません。事前に maker-00 (DEV から保存) を実行して develop に変更を積んでください。"
+            exit 1
+          fi
+          echo "::notice::develop は main より ${AHEAD} commit 進んでいます。release PR を起票します。"
+          EXISTING=$(gh pr list --base main --head develop --json url --jq '.[0].url // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "::notice::既存 release PR を使用: $EXISTING"
+            echo "pr_url=$EXISTING" >> "$GITHUB_OUTPUT"
+          else
+            PR_URL=$(gh pr create \
+              --base main \
+              --head develop \
+              --title "release: ${SOLUTION_NAME} ($(date -u +%Y-%m-%d))" \
+              --body "${REASON}
+
+          Triggered by: @${{ github.actor }}
+          Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ---
+
+          ### この PR について
+          - develop に積まった変更を main に取り込み、STG へデプロイします。
+          - 純粋な app 変更のみの場合: CI green になり次第 auto-merge。
+          - settings/deployment-settings.*.json / .github/** / scripts/** を含む場合: CODEOWNERS (CoE) 承認後に auto-merge。")
+            echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+            echo "::notice::release PR を起票しました: $PR_URL"
+          fi
+
+      - name: Enable auto-merge (merge commit)
+        id: merge
+        if: steps.pr.outputs.pr_url != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # --squash ではなく --merge (true merge commit)。
+          # 理由: develop の history を圧縮すると「追加→削除」中間 commit が打ち消し合い、main 側に旧ファイルが残る副作用。
+          # auto-merge は必須 check がある場合のみ予約可能。即 merge 可能なら即時 merge にフォールバック。
+          MERGED_IMMEDIATELY=false
+          if gh pr merge --auto --merge "${{ steps.pr.outputs.pr_url }}" 2>/tmp/automerge.err; then
+            echo "::notice::auto-merge を有効化しました (CI / 必須レビュー完了次第 merge commit されます)"
+          else
+            cat /tmp/automerge.err
+            echo "::notice::auto-merge を予約できないため、即時 merge を実行します"
+            gh pr merge --merge --delete-branch=false "${{ steps.pr.outputs.pr_url }}"
+            echo "::notice::PR を即時 merge しました"
+            MERGED_IMMEDIATELY=true
+          fi
+          echo "merged_immediately=${MERGED_IMMEDIATELY}" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger deploy-to-stg.yml (GITHUB_TOKEN 制約の回避)
+        if: steps.merge.outputs.merged_immediately == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # GITHUB_TOKEN による PR merge 由来の push は後続 workflow を発火させない仕様。
+          # 即時 merge の場合だけ明示 dispatch。
+          echo "::notice::deploy-to-stg.yml を明示 dispatch します (即時 merge の場合のみ)"
+          gh workflow run deploy-to-stg.yml \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            -f solution_name="${{ inputs.solution_name }}"
+          echo "::notice::dispatch 完了。進捗: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/deploy-to-stg.yml"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## STG デプロイ依頼"
+            echo ""
+            echo "- Solution: ${{ inputs.solution_name }}"
+            echo "- 変更概要: ${{ inputs.reason }}"
+            if [ -n '${{ steps.pr.outputs.pr_url }}' ]; then
+              echo "- Release PR: ${{ steps.pr.outputs.pr_url }}"
+              echo "- 後続: PR auto-merge -> deploy-to-stg.yml -> verify-and-tag (環境オーナー承認) -> STG verified tag"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

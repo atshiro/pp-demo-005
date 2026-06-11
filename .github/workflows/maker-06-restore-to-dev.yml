@@ -1,0 +1,115 @@
+# Maker - 過去バージョンへ復元 (DEV のみ)
+#
+# 【何をする workflow か】
+# 指定した過去時点 (release tag / commit SHA / `develop@{日付}`) の Solution を
+# DEV 環境に書き戻します。`maker-00` (DEV から保存) の対になる動線です。
+# unmanaged で force-overwrite するため Power Platform の Version 制約には引っかかりません。
+#
+# 【こういう時に使う】
+#   - Maker が壊した試行を全部破棄して過去の状態に戻したい
+#   - 「先月の構成」をもう一度 DEV に並べて比較したい
+#   - 別の Maker が触る前の状態を再現したい
+#
+# 【scope】
+#   v0 では **戻し先は DEV 環境のみ**。STG / PRD への直接ロールバックは
+#   `maker-01` (STG リリース) / `maker-02` (PRD デプロイ) の通常動線で行ってください。
+#   ・DEV を戻したい時点に巻き戻す  → 本 workflow
+#   ・STG/PRD に過去状態を反映したい → 本 workflow → maker-01 → (必要なら) maker-02
+#
+# 【source_ref に何を指定するか】 (バリデーション付き、以下のいずれか)
+#   1. release tag        : 例 `v0.1.0-stg-verified` / `v0.1.0-prd-verified`
+#   2. commit SHA (7-40)  : 例 `a1b2c3d` / `a1b2c3d4e5f6...`
+#   3. develop の時点指定 : 例 `develop@{2026-05-25}` / `develop@{2.weeks.ago}`
+#
+# 【操作】
+#   Actions タブ → "Maker - 過去バージョンへ復元 (DEV)" → "Run workflow"
+#     ├─ solution_name : SampleSolution
+#     ├─ source_ref    : v0.1.0-stg-verified  ← 戻したい時点
+#     └─ reason        : "本日の試行をリセット"
+#   → "Run"
+#
+# 【完了後】
+#   - DEV 環境に source_ref 時点の Solution が unmanaged で再 import されます
+#   - 履歴 tag `dev-restored/<sanitized-ref>-<YYYYMMDD-HHMM>` が source_ref の commit に付きます
+#     (「いつ・誰が・何を戻したか」が tag 名だけで追える)
+#
+# 【前提】
+#   - 指定する source_ref が repo 上に存在する (tag / commit / develop の指定日時)
+#   - DEV 環境への import 権限を持つ中央 FIC `fic-central-_reusable-restore-to-dev`
+#     が DEVSTG SPN に登録済み (初回セットアップは CoE が `scripts/add-central-fic.ps1` で実施)
+#
+# STEP-OWNER: 表 2 Step 08.7 を担う。実行者 = Maker (dispatch)、種別 = 半自動。
+
+name: Maker - 過去バージョンへ復元 (DEV)
+
+run-name: "DEV 復元: ${{ inputs.solution_name }} ← ${{ inputs.source_ref }} (by @${{ github.actor }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      solution_name:
+        description: "復元する Solution の Unique Name"
+        required: true
+        type: string
+        default: "SampleSolution"
+      source_ref:
+        description: "戻したい時点 (release tag / 7-40 桁の commit SHA / `develop@{2026-05-25}`)"
+        required: true
+        type: string
+        default: "v0.1.0-stg-verified"
+      reason:
+        description: "復元理由 (履歴 tag 説明 / 監査ログ用) - 例: '本日の試行をリセット'"
+        required: true
+        type: string
+        default: "過去バージョンへ復元"
+
+permissions:
+  actions: write   # 内部 workflow を dispatch するために必要
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate source_ref format
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          # 受け付ける 3 パターン:
+          #   - release tag    : v<MAJOR>.<MINOR>.<PATCH>-(stg|prd)-verified
+          #   - commit SHA     : 7-40 桁の hex
+          #   - develop reflog : develop@{...}
+          if [[ ! "$SOURCE_REF" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+-(stg|prd)-verified|[0-9a-fA-F]{7,40}|develop@\{.+\})$ ]]; then
+            echo "::error::source_ref の形式が不正です。入力値: '$SOURCE_REF'"
+            echo "::error::次のいずれかの形式で入力してください:"
+            echo "::error::  - release tag (例: v0.1.0-stg-verified / v1.2.0-prd-verified)"
+            echo "::error::  - commit SHA  (7-40 桁の hex、例: a1b2c3d)"
+            echo "::error::  - develop の時点 (例: develop@{2026-05-25} / develop@{2.weeks.ago})"
+            exit 1
+          fi
+          echo "::notice::source_ref バリデーション OK: $SOURCE_REF"
+
+      - name: Dispatch restore-to-dev.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOLUTION_NAME: ${{ inputs.solution_name }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          echo "::notice::Dispatching restore-to-dev.yml for ${SOLUTION_NAME} (source_ref=${SOURCE_REF})"
+          # 内部 dispatch は常に develop ブランチから起動 (Maker のドロップダウン選択ミスを隠蔽)。
+          gh workflow run restore-to-dev.yml \
+            --repo "${{ github.repository }}" \
+            --ref develop \
+            -f solution_name="${SOLUTION_NAME}" \
+            -f source_ref="${SOURCE_REF}" \
+            -f reason="${REASON}"
+
+      - name: Show status link
+        run: |
+          ACTIONS_URL="${{ github.server_url }}/${{ github.repository }}/actions/workflows/restore-to-dev.yml"
+          echo "::notice::DEV 復元リクエストを受け付けました。"
+          echo "::notice::進捗: ${ACTIONS_URL}"
+          echo "::notice::完了後、DEV 環境に source_ref 時点の Solution が unmanaged で再 import され、履歴 tag が付与されます。"

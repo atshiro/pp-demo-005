@@ -1,0 +1,55 @@
+name: '06-restore-to-dev'
+
+# 過去バージョン (release tag / commit SHA / `develop@{日付}`) を DEV 環境に
+# 書き戻す薄いラッパー。実体は coe-central-repo の _reusable-restore-to-dev.yml にあり、
+# 本ファイルはトリガ定義と呼び出し元 repo 固有の Variables 受け渡しのみを担う。
+#
+# 【中央化の理由】Entra ID FIC が 20 件/SPN 上限のため、案件 repo ごとに FIC を
+# 追加する構成ではすぐに枯渇する。中央 reusable workflow + OIDC sub claim
+# customization (provision-app-repo.yml Step 04.5 で適用済み) により、FIC は中央
+# reusable workflow ごとに 1 個で全案件 repo から使える
+# (subject = job_workflow_ref:atshiro/coe-central-repo/.github/workflows/_reusable-restore-to-dev.yml@refs/heads/main)。
+#
+# 【操作 (Maker via maker-06-restore-to-dev)】
+#   Maker が `Maker - 過去バージョンへ復元 (DEV)` ボタンを押すと本 workflow が
+#   dispatch される。Maker が指定するのは:
+#     - solution_name
+#     - source_ref (release tag / commit SHA / `develop@{日付}`)
+#     - reason
+#
+# 【CoE が直接押す逃げ道】
+#   maker-06 を経由せず CoE が Actions タブから本 workflow を直接 Run することも可能。
+#
+# STEP-OWNER: 表 2 Step 08.7 を担う。
+
+on:
+  workflow_dispatch:
+    inputs:
+      solution_name:
+        description: 'Solution の Unique Name'
+        required: true
+        default: 'SampleSolution'
+      source_ref:
+        description: '戻したい時点 (release tag / commit SHA / `develop@{日付}`)'
+        required: true
+        default: 'v0.1.0-stg-verified'
+      reason:
+        description: '復元理由 (履歴 tag 説明 / 監査ログ用)'
+        required: false
+        default: '過去バージョンへ復元'
+
+permissions:
+  contents: write   # 履歴 tag の push に必要
+  id-token: write   # 中央 reusable workflow が OIDC を使うため必要
+  actions: read
+
+jobs:
+  restore:
+    uses: atshiro/coe-central-repo/.github/workflows/_reusable-restore-to-dev.yml@main
+    with:
+      solution_name: ${{ inputs.solution_name }}
+      source_ref: ${{ inputs.source_ref }}
+      reason: ${{ inputs.reason }}
+      env_dev_url: ${{ vars.PP_ENV_DEV_URL }}
+      app_client_id_devstg: ${{ vars.PP_APP_CLIENT_ID_DEVSTG }}
+      tenant_id: ${{ vars.PP_TENANT_ID }}
