@@ -40,6 +40,12 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout (gh pr create が内部で git を呼ぶため必要)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
       - name: Open release PR (develop -> main)
         id: pr
         env:
